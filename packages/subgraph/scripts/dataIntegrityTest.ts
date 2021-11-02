@@ -69,13 +69,13 @@ function chunkPromises(promises: Promise<void>[], chunkLength: number) {
  * @dev Gets all the results from the graph, we need this function
  * due to the 1,000 item limitation imposed by the
  */
-async function getAllResults<T extends IBaseEntity>(
+const getAllResults = async <T extends IBaseEntity>(
     query: string,
     endpoint: string,
     blockNumber: number,
     resultsPerPage: number,
     createdAtTimestamp: number = 0
-): Promise<T[]> {
+): Promise<T[]> => {
     const initialResults = await subgraphRequest<{ response: T[] }>(
         query,
         endpoint,
@@ -103,41 +103,21 @@ async function getAllResults<T extends IBaseEntity>(
             Number(newCreatedAtTimestamp)
         )) as T[]),
     ];
-}
+};
 
-async function main() {
-    const network = await ethers.provider.getNetwork();
-    const chainId = network.chainId;
-    const chainIdData = chainIdToData.get(chainId);
-    if (chainIdData == null) {
-        throw new Error("chainId " + chainId + " is not a supported chainId.");
-    }
-    // Give the Indexer 150 block cushion
-    const currentBlockNumber = await getMostRecentIndexedBlockNumber(
-        chainIdData.subgraphAPIEndpoint
-    );
-    console.log(
-        "Executing Subgraph Data Integrity Test on " +
-            chainIdData.name +
-            " network."
-    );
-    console.log("Current block number used to query: ", currentBlockNumber);
-
-    const cfaV1 = (await ethers.getContractAt(
-        cfaABI,
-        maticAddresses.cfaAddress
-    )) as ConstantFlowAgreementV1;
-    const idaV1 = (await ethers.getContractAt(
-        idaABI,
-        maticAddresses.idaAddress
-    )) as InstantDistributionAgreementV1;
-
-    async function validateNetFlowRate(
-        ats: IDataIntegrityAccountTokenSnapshot
-    ) {
+// Validation Logic Helper Functions
+const validateATSNetFlowRate = async (
+    cfaV1: ConstantFlowAgreementV1,
+    ats: IDataIntegrityAccountTokenSnapshot,
+    currentBlockNumber: number
+) => {
+    try {
         const netFlowRate = await cfaV1.getNetFlow(
             ats.token.id,
-            ats.account.id
+            ats.account.id,
+            {
+                blockTag: currentBlockNumber,
+            }
         );
         const netFlowRateShouldMatch = netFlowRate.eq(
             toBN(ats.totalNetFlowRate)
@@ -150,8 +130,167 @@ async function main() {
                     netFlowRate.toString()
             );
         }
+    } catch (err) {
+        console.error(err);
     }
+};
 
+const validateStreamData = async (
+    cfaV1: ConstantFlowAgreementV1,
+    stream: IDataIntegrityStream,
+    currentBlockNumber: number
+) => {
+    try {
+        const token = ethers.utils.getAddress(stream.token.id);
+        const sender = ethers.utils.getAddress(stream.sender.id);
+        const receiver = ethers.utils.getAddress(stream.receiver.id);
+        const [updatedAtTimestamp, flowRate] = await cfaV1.getFlow(
+            token,
+            sender,
+            receiver,
+            {
+                blockTag: currentBlockNumber,
+            }
+        );
+        const updatedAtShouldMatch = updatedAtTimestamp.eq(
+            toBN(stream.updatedAtTimestamp)
+        );
+        const flowRateShouldMatch = flowRate.eq(toBN(stream.currentFlowRate));
+        const compareStream = {
+            updatedAtTimestamp: stream.updatedAtTimestamp,
+            currentFlowRate: stream.currentFlowRate,
+        };
+        if (!updatedAtShouldMatch || !flowRateShouldMatch) {
+            throw new Error(
+                "Values don't match. \n Subgraph Stream: " +
+                    JSON.stringify(compareStream) +
+                    "\n Contract Data \n Updated At Timestamp: " +
+                    updatedAtTimestamp.toString() +
+                    " \n Flow Rate: " +
+                    flowRate.toString()
+            );
+        }
+    } catch (err) {
+        console.error("Error: ", err);
+    }
+};
+
+const validateIndexData = async (
+    idaV1: InstantDistributionAgreementV1,
+    index: IDataIntegrityIndex,
+    currentBlockNumber: number
+) => {
+    try {
+        const superToken = ethers.utils.getAddress(index.token.id);
+        const publisher = ethers.utils.getAddress(index.publisher.id);
+        const indexId = Number(index.indexId);
+        const [, indexValue, totalUnitsApproved, totalUnitsPending] =
+            await idaV1.getIndex(superToken, publisher, indexId, {
+                blockTag: currentBlockNumber,
+            });
+        const indexValueShouldMatch = toBN(index.indexValue).eq(indexValue);
+        const totalUnitsApprovedShouldMatch = toBN(index.totalUnitsApproved).eq(
+            totalUnitsApproved
+        );
+        const totalUnitsPendingShouldMatch = toBN(index.totalUnitsPending).eq(
+            totalUnitsPending
+        );
+        const compareIndex = {
+            id: index.id,
+            indexValue: index.indexValue,
+            totalUnitsApproved: index.totalUnitsApproved,
+            totalUnitsPending: index.totalUnitsPending,
+        };
+        if (
+            !indexValueShouldMatch ||
+            !totalUnitsApprovedShouldMatch ||
+            !totalUnitsPendingShouldMatch
+        ) {
+            throw new Error(
+                "Values don't match. \n Subgraph Index: " +
+                    JSON.stringify(compareIndex) +
+                    "\n Contract Data \n Index Value: " +
+                    indexValue.toString() +
+                    " \n Approved Units: " +
+                    totalUnitsApproved.toString() +
+                    " \n Pending Units: " +
+                    totalUnitsPending.toString()
+            );
+        }
+    } catch (err) {
+        console.error("Error: ", err);
+    }
+};
+
+const validateSubscriptionData = async (
+    idaV1: InstantDistributionAgreementV1,
+    subscription: IDataIntegritySubscription,
+    currentBlockNumber: number
+) => {
+    try {
+        const superToken = ethers.utils.getAddress(subscription.index.token.id);
+        const publisher = ethers.utils.getAddress(
+            subscription.index.publisher.id
+        );
+        const subscriber = ethers.utils.getAddress(subscription.subscriber.id);
+        const indexId = Number(subscription.index.indexId);
+        const [, approved, units, pendingDistribution] =
+            await idaV1.getSubscription(
+                superToken,
+                publisher,
+                indexId,
+                subscriber,
+                { blockTag: currentBlockNumber }
+            );
+        const expectedPendingDistribution = subscription.approved
+            ? toBN(0)
+            : toBN(subscription.units).mul(
+                  toBN(subscription.index.indexValue).sub(
+                      toBN(subscription.indexValueUntilUpdatedAt)
+                  )
+              );
+        const approvedShouldMatch = approved === subscription.approved;
+        const unitsShouldMatch = toBN(subscription.units).eq(units);
+        const pendingDistributionShouldMatch =
+            expectedPendingDistribution.eq(pendingDistribution);
+        const compareSubscription = {
+            id: subscription.id,
+            approved: subscription.approved,
+            units: subscription.units,
+            pendingDistribution: expectedPendingDistribution.toString(),
+        };
+
+        if (
+            !approvedShouldMatch ||
+            !unitsShouldMatch ||
+            !pendingDistributionShouldMatch
+        ) {
+            throw new Error(
+                "Values don't match. \n Subgraph Subscription: " +
+                    JSON.stringify(compareSubscription) +
+                    "\n Contract Data \n Approved: " +
+                    approved +
+                    " \n Units: " +
+                    units.toString() +
+                    " \n Pending Units: " +
+                    pendingDistribution.toString()
+            );
+        }
+    } catch (error) {
+        console.error("Error: ", error);
+    }
+};
+
+// Agreement Validation Harness Helper Functions
+const validateCFAData = async (
+    cfaV1: ConstantFlowAgreementV1,
+    chainIdData: {
+        subgraphAPIEndpoint: string;
+        name: string;
+    },
+    currentBlockNumber: number
+) => {
+    console.log("Getting CFA data from the subgraph...");
     const streams = await getAllResults<IDataIntegrityStream>(
         getStreams,
         chainIdData.subgraphAPIEndpoint,
@@ -162,16 +301,31 @@ async function main() {
         streams,
         (x) => x.createdAtTimestamp + x.sender.id + x.receiver.id + x.token.id
     );
-    const accountTokenSnapshots = _.uniqBy(
-        uniqueStreams
-            .map((x) => [
-                ...x.sender.accountTokenSnapshots,
-                ...x.receiver.accountTokenSnapshots,
-            ])
-            .flat(),
-        (x) => x.account.id + x.token.id
-    );
 
+    const validateStreamPromises = uniqueStreams.map((x) =>
+        validateStreamData(cfaV1, x, currentBlockNumber)
+    );
+    const chunkedStreamPromises = chunkPromises(validateStreamPromises, 100);
+
+    console.log("Stream Tests Starting...");
+    console.log("Validating " + validateStreamPromises.length + " streams.");
+    for (let i = 0; i < chunkedStreamPromises.length; i++) {
+        await Promise.all(chunkedStreamPromises[i]);
+    }
+    console.log("Stream Tests Successful!");
+
+    return { uniqueStreams };
+};
+
+const validateIDAData = async (
+    idaV1: InstantDistributionAgreementV1,
+    chainIdData: {
+        subgraphAPIEndpoint: string;
+        name: string;
+    },
+    currentBlockNumber: number
+) => {
+    console.log("Getting IDA data from the subgraph...");
     const indexes = await getAllResults<IDataIntegrityIndex>(
         getIndexes,
         chainIdData.subgraphAPIEndpoint,
@@ -185,160 +339,18 @@ async function main() {
         1000
     );
 
-    const streamPromises = uniqueStreams.map(async (x) => {
-        const stream = x;
-        try {
-            const token = ethers.utils.getAddress(stream.token.id);
-            const sender = ethers.utils.getAddress(stream.sender.id);
-            const receiver = ethers.utils.getAddress(stream.receiver.id);
-            const [updatedAtTimestamp, flowRate] = await cfaV1.getFlow(
-                token,
-                sender,
-                receiver
-            );
-            const updatedAtShouldMatch = updatedAtTimestamp.eq(
-                toBN(stream.updatedAtTimestamp)
-            );
-            const flowRateShouldMatch = flowRate.eq(
-                toBN(stream.currentFlowRate)
-            );
-            const compareStream = {
-                updatedAtTimestamp: stream.updatedAtTimestamp,
-                currentFlowRate: stream.currentFlowRate,
-            };
-            if (!updatedAtShouldMatch || !flowRateShouldMatch) {
-                throw new Error(
-                    "Values don't match. \n Subgraph Stream: " +
-                        JSON.stringify(compareStream) +
-                        "\n Contract Data \n Updated At Timestamp: " +
-                        updatedAtTimestamp.toString() +
-                        " \n Flow Rate: " +
-                        flowRate.toString()
-                );
-            }
-        } catch (err) {
-            console.error("Error: ", err);
-        }
-    });
-
-    const accountTokenSnapshotPromises = accountTokenSnapshots.map(async (x) =>
-        validateNetFlowRate(x)
+    const indexPromises = indexes.map((x) =>
+        validateIndexData(idaV1, x, currentBlockNumber)
     );
 
-    const indexPromises = indexes.map(async (x) => {
-        const index = x;
-        try {
-            const superToken = ethers.utils.getAddress(index.token.id);
-            const publisher = ethers.utils.getAddress(index.publisher.id);
-            const indexId = Number(index.indexId);
-            const [, indexValue, totalUnitsApproved, totalUnitsPending] =
-                await idaV1.getIndex(superToken, publisher, indexId, {
-                    blockTag: currentBlockNumber,
-                });
-            const indexValueShouldMatch = toBN(index.indexValue).eq(indexValue);
-            const totalUnitsApprovedShouldMatch = toBN(
-                index.totalUnitsApproved
-            ).eq(totalUnitsApproved);
-            const totalUnitsPendingShouldMatch = toBN(
-                index.totalUnitsPending
-            ).eq(totalUnitsPending);
-            const compareIndex = {
-                indexValue: index.indexValue,
-                totalUnitsApproved: index.totalUnitsApproved,
-                totalUnitsPending: index.totalUnitsPending,
-            };
-            if (
-                !indexValueShouldMatch ||
-                !totalUnitsApprovedShouldMatch ||
-                !totalUnitsPendingShouldMatch
-            ) {
-                throw new Error(
-                    "Values don't match. \n Subgraph Index: " +
-                        JSON.stringify(compareIndex) +
-                        "\n Contract Data \n Index Value: " +
-                        indexValue.toString() +
-                        " \n Approved Units: " +
-                        totalUnitsApproved.toString() +
-                        " \n Pending Units: " +
-                        totalUnitsPending.toString()
-                );
-            }
-        } catch (err) {
-            console.error("Error: ", err);
-        }
-    });
-
-    const subscriptionPromises = subscriptions.map(async (x) => {
-        const subscription = x;
-        try {
-            const superToken = ethers.utils.getAddress(
-                subscription.index.token.id
-            );
-            const publisher = ethers.utils.getAddress(
-                subscription.index.publisher.id
-            );
-            const subscriber = ethers.utils.getAddress(
-                subscription.subscriber.id
-            );
-            const indexId = Number(subscription.index.indexId);
-            const [, approved, units, pendingDistribution] =
-                await idaV1.getSubscription(
-                    superToken,
-                    publisher,
-                    indexId,
-                    subscriber,
-                    { blockTag: currentBlockNumber }
-                );
-            const expectedPendingDistribution = subscription.approved
-                ? toBN(0)
-                : toBN(subscription.units).mul(
-                      toBN(subscription.index.indexValue).sub(
-                          toBN(subscription.indexValueUntilUpdatedAt)
-                      )
-                  );
-            const approvedShouldMatch = approved === subscription.approved;
-            const unitsShouldMatch = toBN(subscription.units).eq(units);
-            const pendingDistributionShouldMatch =
-                expectedPendingDistribution.eq(pendingDistribution);
-            const compareSubscription = {
-                approved: subscription.approved,
-                units: subscription.units,
-                pendingDistribution: expectedPendingDistribution.toString(),
-            };
-
-            if (
-                !approvedShouldMatch ||
-                !unitsShouldMatch ||
-                !pendingDistributionShouldMatch
-            ) {
-                throw new Error(
-                    "Values don't match. \n Subgraph Subscription: " +
-                        JSON.stringify(compareSubscription) +
-                        "\n Contract Data \n Approved: " +
-                        approved +
-                        " \n Units: " +
-                        units.toString() +
-                        " \n Pending Units: " +
-                        pendingDistribution.toString()
-                );
-            }
-        } catch (error) {
-            console.error("Error: ", error);
-        }
-    });
-    const chunkedStreamPromises = chunkPromises(streamPromises, 100);
+    const subscriptionPromises = subscriptions.map((x) =>
+        validateSubscriptionData(idaV1, x, currentBlockNumber)
+    );
     const chunkedIndexPromises = chunkPromises(indexPromises, 100);
     const chunkedSubscriptionPromises = chunkPromises(
         subscriptionPromises,
         100
     );
-    const chunkedATSPromises = chunkPromises(accountTokenSnapshotPromises, 100);
-    console.log("Stream Tests Starting...");
-    console.log("Validating " + streamPromises.length + " streams.");
-    for (let i = 0; i < chunkedStreamPromises.length; i++) {
-        await Promise.all(chunkedStreamPromises[i]);
-    }
-    console.log("Stream Tests Successful!");
     console.log("Index Tests Starting...");
     console.log("Validating " + indexPromises.length + " indexes.");
     for (let i = 0; i < chunkedIndexPromises.length; i++) {
@@ -353,6 +365,27 @@ async function main() {
         await Promise.all(chunkedSubscriptionPromises[i]);
     }
     console.log("Subscription Tests Successful!");
+};
+
+const validateAggregateEntityData = async (
+    cfaV1: ConstantFlowAgreementV1,
+    uniqueStreams: IDataIntegrityStream[],
+    currentBlockNumber: number
+) => {
+    const uniqueAccountTokenSnapshots = _.uniqBy(
+        uniqueStreams
+            .map((x) => [
+                ...x.sender.accountTokenSnapshots,
+                ...x.receiver.accountTokenSnapshots,
+            ])
+            .flat(),
+        (x) => x.account.id + x.token.id
+    );
+
+    const accountTokenSnapshotPromises = uniqueAccountTokenSnapshots.map((x) =>
+        validateATSNetFlowRate(cfaV1, x, currentBlockNumber)
+    );
+    const chunkedATSPromises = chunkPromises(accountTokenSnapshotPromises, 100);
     console.log("Account Token Snapshot Tests Starting...");
     console.log(
         "Validating " +
@@ -363,7 +396,54 @@ async function main() {
         await Promise.all(chunkedATSPromises[i]);
     }
     console.log("Account Token Snapshot Tests Successful!");
-}
+};
+
+const main = async () => {
+    try {
+        const network = await ethers.provider.getNetwork();
+        const chainId = network.chainId;
+        const chainIdData = chainIdToData.get(chainId);
+        if (chainIdData == null) {
+            throw new Error(
+                "chainId " + chainId + " is not a supported chainId."
+            );
+        }
+        // Give the Indexer 150 block cushion
+        const currentBlockNumber = await getMostRecentIndexedBlockNumber(
+            chainIdData.subgraphAPIEndpoint
+        );
+        console.log(
+            "Executing Subgraph Data Integrity Test on " +
+                chainIdData.name +
+                " network."
+        );
+        console.log("Current block number used to query: ", currentBlockNumber);
+
+        const cfaV1 = (await ethers.getContractAt(
+            cfaABI,
+            maticAddresses.cfaAddress
+        )) as ConstantFlowAgreementV1;
+        const idaV1 = (await ethers.getContractAt(
+            idaABI,
+            maticAddresses.idaAddress
+        )) as InstantDistributionAgreementV1;
+        const { uniqueStreams } = await validateCFAData(
+            cfaV1,
+            chainIdData,
+            currentBlockNumber
+        );
+
+        await validateIDAData(idaV1, chainIdData, currentBlockNumber);
+
+        await validateAggregateEntityData(
+            cfaV1,
+            uniqueStreams,
+            currentBlockNumber
+        );
+    } catch (err) {
+        console.error(err);
+    }
+};
 
 main()
     .then(() => process.exit(0))
