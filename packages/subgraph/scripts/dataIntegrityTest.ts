@@ -382,6 +382,19 @@ const validateAggregateEntityData = async (
         (x) => x.account.id + x.token.id
     );
 
+    // NOTE: each token's net flow should be 0, so summing all
+    // should also equal to 0.
+    console.log("Validate Sum of CFA total netflow === zero");
+    const sumNetFlows = uniqueAccountTokenSnapshots.reduce(
+        (x, y) => x + Number(y.totalNetFlowRate),
+        0
+    );
+    
+    if (sumNetFlows !== 0) {
+        throw new Error("Sum of CFA total netflow !== zero");
+    }
+    console.log("Sum of CFA total netflow === zero is true");
+
     const accountTokenSnapshotPromises = uniqueAccountTokenSnapshots.map((x) =>
         validateATSNetFlowRate(cfaV1, x, currentBlockNumber)
     );
