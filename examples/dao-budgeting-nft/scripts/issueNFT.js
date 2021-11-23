@@ -28,7 +28,7 @@ const deployedBudgetNFT = require("../deployments/kovan/BudgetNFT.json");
 const budgetNFTAddress = deployedBudgetNFT.address;
 
 
-//address of owner of option here..need to change this
+//TODO: address of owner of option here..need to change this
 const _receiver = "0x5966aa11c794893774a382d9a19743B8be6BFFd1";
 const _sender = "0x9421FE8eCcAfad76C3A9Ec8f9779fAfA05A836B3";
 // When running the script with `npx hardhat run <script>` you'll find the Hardhat
@@ -48,9 +48,10 @@ async function main() {
   const nonce = await web3.eth.getTransactionCount(_sender, 'latest'); // nonce starts counting from 0
 
 
-  const txData = (await budgetNFT.methods.issueNFT(_receiver, "38580246913")).encodeABI() //~100 per mo
+  const txData = (await budgetNFT.methods.issueNFT(_receiver, "580246913")).encodeABI() //~100 per mo
 
   //send the tx to the contract
+  // this is from Alchemy
   let tx = {
     'to': budgetNFTAddress,
     'gas': 3000000,

@@ -41,7 +41,7 @@ task("unlock", "set up impersonating accounts", async () => {
 module.exports = {
   defaultNetwork,
   solidity: {
-    version: "0.7.0",
+    version: "0.8.0",
     settings: {
       optimizer: {
         enabled: true
